@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redactortron"
+version = "0.1.0"
+description = "Local AI-powered document redaction with interactive category selection (docTR + GLiNER + OpenCV)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Redactortron Contributors" },
+]
+keywords = [
+    "redaction",
+    "ocr",
+    "ner",
+    "gliner",
+    "doctr",
+    "privacy",
+    "pii",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Legal Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Security",
+]
+dependencies = [
+    "python-doctr>=0.8.0",
+    "torch>=2.0.0",
+    "gliner>=0.2.0",
+    "opencv-python-headless>=4.8.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    "pdf2image>=1.16.0",
+    "questionary>=2.0.0",
+    "rich>=13.0.0",
+    "gradio>=4.0.0",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "python-multipart>=0.0.9",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+    "redactortron[api]",
+]
+
+[project.urls]
+Homepage = "https://github.com/example/redactortron"
+Documentation = "https://github.com/example/redactortron#readme"
+
+[project.scripts]
+redactortron = "redactortron.cli:main"
+redactortron-ui = "redactortron.webui:main"
+
+[tool.setuptools.packages.find]
+include = ["redactortron*"]
+
+[tool.setuptools.package-data]
+redactortron = ["assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

@@ -48,4 +48,6 @@ def test_scan_result_categories_and_filter() -> None:
     label = result.all_entities[0].display_label()
     assert label.startswith("E0001")
     assert "PERSON" in label
+    assert "[ACCT]" in label
     assert ScanResult.entity_id_from_choice(label) == "E0001"
+    assert result.all_entities[0].family == "account"

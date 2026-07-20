@@ -46,6 +46,9 @@ class WordSpan:
     end_char: int
 
 
+from redactortron.taxonomy import category_family
+
+
 @dataclass
 class DetectedEntity:
     """A named entity located on a document page."""
@@ -64,16 +67,26 @@ class DetectedEntity:
         """Normalized category key used for interactive selection."""
         return self.label.strip().upper()
 
-    def display_label(self) -> str:
+    @property
+    def family(self) -> str:
+        """``account``, ``transaction``, or ``other``."""
+        return category_family(self.category)
+
+    def display_label(self, *, show_meta: bool = True) -> str:
         """Human-readable line for checklists (transactions / entities)."""
-        eid = self.entity_id or "?"
         snippet = self.text.replace("\n", " ").strip()
         if len(snippet) > 64:
             snippet = snippet[:61] + "..."
-        return (
-            f"{eid} · p{self.page_index + 1} · {self.category} · "
-            f"{snippet} ({self.score:.2f})"
+        family_tag = "TX" if self.family == "transaction" else (
+            "ACCT" if self.family == "account" else "OTHER"
         )
+        if show_meta:
+            eid = self.entity_id or "?"
+            return (
+                f"{eid} · p{self.page_index + 1} · [{family_tag}] {self.category} · "
+                f"{snippet} ({self.score:.2f})"
+            )
+        return f"p{self.page_index + 1} · [{family_tag}] {self.category} · {snippet}"
 
 
 @dataclass
@@ -119,9 +132,27 @@ class ScanResult:
         wanted = {i.strip().upper() for i in entity_ids if str(i).strip()}
         return [e for e in self.all_entities if e.entity_id.upper() in wanted]
 
-    def item_choices(self) -> List[str]:
-        """Checklist labels for every itemized entity / transaction."""
-        return [e.display_label() for e in self.all_entities]
+    def item_choices(
+        self,
+        *,
+        categories: Optional[List[str]] = None,
+        view: str = "All",
+        show_meta: bool = True,
+    ) -> List[str]:
+        """Checklist labels, optionally filtered by active categories + matrix view."""
+        from redactortron.taxonomy import view_allows_family
+
+        wanted = None
+        if categories is not None:
+            wanted = {c.strip().upper() for c in categories}
+        labels: List[str] = []
+        for entity in self.all_entities:
+            if wanted is not None and entity.category not in wanted:
+                continue
+            if not view_allows_family(view, entity.family):
+                continue
+            labels.append(entity.display_label(show_meta=show_meta))
+        return labels
 
     @staticmethod
     def entity_id_from_choice(choice: str) -> str:

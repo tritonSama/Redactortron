@@ -31,7 +31,19 @@ if not defined BOOT (
 echo Using Python bootstrap: %BOOT%
 
 REM --- 2. Create the local virtual environment (.venv) ---
-if not exist ".venv\Scripts\python.exe" (
+set "VENV_PY=%~dp0.venv\Scripts\python.exe"
+
+REM A .venv copied from another PC has broken hard-coded paths - rebuild it.
+if exist "%VENV_PY%" (
+    "%VENV_PY%" -c "import sys" >nul 2>&1
+    if errorlevel 1 (
+        echo Existing .venv does not work on this PC ^(copied from another machine^).
+        echo Rebuilding it...
+        rmdir /s /q ".venv"
+    )
+)
+
+if not exist "%VENV_PY%" (
     echo Creating virtual environment .venv ...
     %BOOT% -m venv .venv
     if errorlevel 1 (
@@ -41,8 +53,6 @@ if not exist ".venv\Scripts\python.exe" (
     )
 )
 
-set "VENV_PY=%~dp0.venv\Scripts\python.exe"
-
 REM --- 3. Install Redactortron + dependencies (+ bundled Poppler) ---
 echo.
 echo Upgrading pip ...
@@ -50,7 +60,7 @@ echo Upgrading pip ...
 echo.
 echo Installing Redactortron and dependencies.
 echo (First time downloads PyTorch/docTR/GLiNER - this can take a while.)
-"%VENV_PY%" scripts\install_deps.py --with-poppler --api
+"%VENV_PY%" scripts\install_deps.py --with-poppler --api --fetch-models
 if errorlevel 1 (
     echo.
     echo Dependency installation failed. See messages above.

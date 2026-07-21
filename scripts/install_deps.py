@@ -187,6 +187,41 @@ def verify_imports() -> None:
         raise SystemExit("Dependency verification failed:\n  - " + "\n  - ".join(failed))
 
 
+def fetch_models() -> None:
+    """Pre-download the docTR OCR and GLiNER weights into the local cache.
+
+    Doing this at install time (with internet) means the first scan works
+    offline and any download problem shows up HERE, in the console, instead
+    of killing the web server mid-request ("Failed to fetch" in the browser).
+    """
+    info("Pre-downloading AI models (docTR OCR + GLiNER). This can take a while…")
+    try:
+        from doctr.models import ocr_predictor
+
+        info("  Loading docTR OCR predictor…")
+        ocr_predictor(pretrained=True)
+        info("  OK  docTR OCR weights cached")
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(
+            f"Failed to download the docTR OCR model: {exc}\n"
+            "Check your internet connection / proxy and rerun setup."
+        )
+
+    try:
+        from gliner import GLiNER
+
+        model_name = "urchade/gliner_multi_pii-v1"
+        info(f"  Loading GLiNER model {model_name}…")
+        GLiNER.from_pretrained(model_name)
+        info("  OK  GLiNER weights cached")
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(
+            f"Failed to download the GLiNER model: {exc}\n"
+            "Check your internet connection / proxy and rerun setup."
+        )
+    info("All models cached — the app can now scan without internet.")
+
+
 def verify_poppler() -> None:
     local = find_local_poppler_bin()
     if local is not None:
@@ -216,6 +251,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--skip-verify",
         action="store_true",
         help="Skip import / Poppler checks.",
+    )
+    p.add_argument(
+        "--fetch-models",
+        action="store_true",
+        help="Pre-download docTR + GLiNER weights so first scan works offline.",
     )
     return p.parse_args(argv)
 
@@ -250,6 +290,9 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_verify:
         verify_imports()
         verify_poppler()
+
+    if args.fetch_models:
+        fetch_models()
 
     info("Done.")
     info("Start the GUI with:")

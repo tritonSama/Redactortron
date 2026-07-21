@@ -738,62 +738,56 @@ def _parse_labels(labels_text: Optional[str]) -> Optional[List[str]]:
     return parts or None
 
 
-def scan_document(
-    file_obj: Any,
-    threshold: float,
-    labels_text: str,
-    view: str,
-    show_meta: bool,
-    theme_mode: str,
-) -> Tuple[Any, Any, Any, Any, Any, str]:
-    if file_obj is None:
-        raise gr.Error("Upload a PDF or image first.")
-
-    path = Path(file_obj if isinstance(file_obj, str) else file_obj.name)
+def _scan_one(path: Path, threshold: float, labels: Optional[List[str]]) -> Dict[str, Any]:
+    """Scan one file into a self-contained document state (result + statement)."""
     service = get_service()
-
-    try:
-        summary, result = service.scan(
-            path,
-            threshold=float(threshold),
-            labels=_parse_labels(labels_text),
-        )
-    except RedactortronError as exc:
-        exc.log(audience="internal")
-        raise gr.Error(exc.format(audience="public")) from exc
-
+    summary, result = service.scan(path, threshold=float(threshold), labels=labels)
     if not any(e.entity_id for e in result.all_entities):
         result.assign_entity_ids()
 
-    state: Dict[str, Any] = {
+    doc_state: Dict[str, Any] = {
         "path": str(path),
+        "name": path.name,
         "result": result,
         "threshold": float(threshold),
+        "page_count": summary.page_count,
     }
-
-    # Statement parser runs automatically so items are grouped like the tree.
-    statement_tree = (
-        "_No statement structure detected — press **Parse statement** to retry._"
-    )
-    statement_json_val = "[]"
-    header_update = gr.update(choices=[], value=None)
-    statement: Optional[ParsedStatement] = None
     try:
-        statement = _ensure_statement(state)
+        _ensure_statement(doc_state)
     except Exception:
-        logger.exception("Statement parsing failed; continuing without it")
+        logger.exception("Statement parsing failed for %s; continuing", path.name)
+    return doc_state
+
+
+def _doc_panels(
+    doc_state: Dict[str, Any],
+    view: str,
+    show_meta: bool,
+    theme_mode: str,
+    banner: str = "",
+) -> Tuple[Any, Any, Any, Any, str, str, str, Any, str]:
+    """Build every right-hand panel + control update for one active document."""
+    result: ScanResult = doc_state["result"]
+    statement: Optional[ParsedStatement] = doc_state.get("statement")
+
     if statement and statement.transactions:
         statement_tree = statement.tree_markdown()
         statement_json_val = statement.to_json()
         header_update = gr.update(
-            choices=list(state.get("headers", {}).keys()),
+            choices=list(doc_state.get("headers", {}).keys()),
             value=None,
             interactive=True,
         )
+    else:
+        statement_tree = (
+            "_No statement structure detected — press **Parse statement** to retry._"
+        )
+        statement_json_val = "[]"
+        header_update = gr.update(choices=[], value=None)
 
     categories = result.categories()
     items_update, rows, previews, _, _ = _selection_bundle(
-        state,
+        doc_state,
         categories=categories,
         view=view or "All",
         show_meta=bool(show_meta),
@@ -812,10 +806,12 @@ def scan_document(
     tx_count = len(statement.transactions) if statement else 0
     mark = "White/red" if _is_trinidad_theme(theme_mode) else "Cyan"
     summary_md = (
-        f"<div class='rt-status'>⚡ <strong>{len(result.all_entities)}</strong> items · "
+        f"<div class='rt-status'>{banner}"
+        f"📄 <strong>{doc_state.get('name', 'document')}</strong> · "
+        f"<strong>{len(result.all_entities)}</strong> items · "
         f"<strong>{personal}</strong> personal info · "
         f"<strong>{tx_count}</strong> statement transactions · "
-        f"<strong>{summary.page_count}</strong> page(s).<br/>"
+        f"<strong>{doc_state.get('page_count', len(result.pages))}</strong> page(s).<br/>"
         f"Items are grouped page → section → transaction. "
         f"Use the header picker to (un)select a whole section. "
         f"{mark} boxes mark the current selection in Visual feed.</div>"
@@ -827,7 +823,6 @@ def scan_document(
         interactive=bool(categories),
     )
     return (
-        state,
         rows,
         category_update,
         items_update,
@@ -838,6 +833,93 @@ def scan_document(
         header_update,
         date_tree_val,
     )
+
+
+def _unique_name(name: str, taken: Dict[str, Any]) -> str:
+    if name not in taken:
+        return name
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    counter = 2
+    while f"{stem} ({counter}){suffix}" in taken:
+        counter += 1
+    return f"{stem} ({counter}){suffix}"
+
+
+def scan_documents(
+    file_objs: Any,
+    threshold: float,
+    labels_text: str,
+    view: str,
+    show_meta: bool,
+    theme_mode: str,
+) -> Tuple[Any, ...]:
+    if not file_objs:
+        raise gr.Error("Upload one or more PDFs or images first.")
+
+    raw_list = file_objs if isinstance(file_objs, (list, tuple)) else [file_objs]
+    paths = [Path(f if isinstance(f, str) else f.name) for f in raw_list]
+    labels = _parse_labels(labels_text)
+
+    docs: Dict[str, Any] = {}
+    order: List[str] = []
+    errors: List[str] = []
+    for path in paths:
+        try:
+            doc_state = _scan_one(path, threshold, labels)
+        except RedactortronError as exc:
+            exc.log(audience="internal")
+            errors.append(f"{path.name}: {exc.format(audience='public')}")
+            continue
+        name = _unique_name(path.name, docs)
+        doc_state["name"] = name
+        docs[name] = doc_state
+        order.append(name)
+
+    if not docs:
+        raise gr.Error("All uploads failed:\n" + "\n".join(errors))
+
+    active = order[0]
+    state = docs[active]
+
+    banner = ""
+    if len(order) > 1:
+        banner = (
+            f"✅ Scanned <strong>{len(order)}</strong> documents — "
+            f"switch between them with the selector above.<br/>"
+        )
+    if errors:
+        banner += (
+            f"⚠️ {len(errors)} file(s) failed: "
+            f"{'; '.join(errors)[:200]}<br/>"
+        )
+
+    panels = _doc_panels(state, view, show_meta, theme_mode, banner=banner)
+    selector_update = gr.update(
+        choices=order,
+        value=active,
+        interactive=len(order) > 1,
+        visible=len(order) > 1,
+    )
+    return (docs, state, selector_update, *panels)
+
+
+def switch_document(
+    docs: Optional[Dict[str, Any]],
+    name: Optional[str],
+    view: str,
+    show_meta: bool,
+    theme_mode: str,
+) -> Tuple[Any, ...]:
+    if not docs or not name or name not in docs:
+        raise gr.Error("Scan documents first, then pick one from the selector.")
+    state = docs[name]
+    banner = (
+        f"🔀 Viewing <strong>{name}</strong> "
+        f"({list(docs).index(name) + 1} of {len(docs)}).<br/>"
+    )
+    panels = _doc_panels(state, view, show_meta, theme_mode, banner=banner)
+    return (state, *panels)
 
 
 def refresh_filters(
@@ -1522,6 +1604,7 @@ def build_app():
         )
 
         state = gr.State(None)
+        docs_state = gr.State({})
         theme_css = gr.HTML(render_theme_css(THEME_CYBER_LABEL))
 
         with gr.Accordion("Settings", open=False):
@@ -1538,7 +1621,7 @@ def build_app():
         with gr.Row():
             with gr.Column(scale=1):
                 file_in = gr.File(
-                    label="Document uplink",
+                    label="Document uplink (select one or many)",
                     file_types=[
                         ".pdf",
                         ".png",
@@ -1550,6 +1633,14 @@ def build_app():
                         ".webp",
                     ],
                     type="filepath",
+                    file_count="multiple",
+                )
+                doc_selector = gr.Dropdown(
+                    label="Active document (switch between scanned files)",
+                    choices=[],
+                    value=None,
+                    interactive=False,
+                    visible=False,
                 )
                 with gr.Accordion("01 · Detection prompt & parameters", open=False):
                     labels_box = gr.Textbox(
@@ -1687,8 +1778,27 @@ def build_app():
         )
 
         scan_btn.click(
-            fn=scan_document,
+            fn=scan_documents,
             inputs=[file_in, threshold, labels_box, matrix_view, show_meta, theme_mode],
+            outputs=[
+                docs_state,
+                state,
+                doc_selector,
+                entities,
+                categories,
+                items,
+                preview,
+                status,
+                statement_tree_md,
+                statement_json,
+                header_dd,
+                date_tree_md,
+            ],
+        )
+
+        doc_selector.change(
+            fn=switch_document,
+            inputs=[docs_state, doc_selector, matrix_view, show_meta, theme_mode],
             outputs=[
                 state,
                 entities,

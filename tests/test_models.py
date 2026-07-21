@@ -48,6 +48,50 @@ def test_scan_result_categories_and_filter() -> None:
     label = result.all_entities[0].display_label()
     assert label.startswith("E0001")
     assert "PERSON" in label
-    assert "[ACCT]" in label
+    assert "[PI]" in label
     assert ScanResult.entity_id_from_choice(label) == "E0001"
-    assert result.all_entities[0].family == "account"
+    assert result.all_entities[0].family == "personal"
+
+
+def test_add_entities_continues_ids_and_dedupes() -> None:
+    box = BoundingBox(0, 0, 10, 10)
+    page = PageResult(
+        page_index=0,
+        width=100,
+        height=100,
+        full_text="Ada",
+        entities=[DetectedEntity("Ada", "person", 0.9, 0, box)],
+    )
+    result = ScanResult(source_path="doc.pdf", pages=[page])
+    result.assign_entity_ids()
+
+    extra_box = BoundingBox(20, 20, 40, 30)
+    extra = DetectedEntity("Walmart", "word match", 1.0, 0, extra_box)
+    added = result.add_entities([extra])
+    assert [e.entity_id for e in added] == ["E0002"]
+
+    # Same box + category again is a duplicate and must be skipped.
+    dup = DetectedEntity("Walmart", "word match", 1.0, 0, extra_box)
+    assert result.add_entities([dup]) == []
+    assert len(result.all_entities) == 2
+
+
+def test_line_box_and_text() -> None:
+    from redactortron.models import WordSpan
+
+    page = PageResult(
+        page_index=0,
+        width=200,
+        height=100,
+        full_text="12/03/2022 WALMART -45.00",
+        words=[
+            WordSpan("12/03/2022", BoundingBox(0, 0, 50, 10), 0, 0, 10, line_index=0),
+            WordSpan("WALMART", BoundingBox(60, 0, 110, 10), 0, 11, 18, line_index=0),
+            WordSpan("-45.00", BoundingBox(120, 0, 160, 10), 0, 19, 25, line_index=0),
+        ],
+    )
+    assert page.line_text(0) == "12/03/2022 WALMART -45.00"
+    box = page.line_box(0)
+    assert box is not None
+    assert box.as_tuple() == (0, 0, 160, 10)
+    assert page.line_box(5) is None

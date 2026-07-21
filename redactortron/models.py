@@ -44,6 +44,7 @@ class WordSpan:
     page_index: int
     start_char: int
     end_char: int
+    line_index: int = -1
 
 
 from redactortron.taxonomy import category_family
@@ -69,7 +70,7 @@ class DetectedEntity:
 
     @property
     def family(self) -> str:
-        """``account``, ``transaction``, or ``other``."""
+        """``personal``, ``transaction``, or ``other``."""
         return category_family(self.category)
 
     def display_label(self, *, show_meta: bool = True) -> str:
@@ -77,9 +78,7 @@ class DetectedEntity:
         snippet = self.text.replace("\n", " ").strip()
         if len(snippet) > 64:
             snippet = snippet[:61] + "..."
-        family_tag = "TX" if self.family == "transaction" else (
-            "ACCT" if self.family == "account" else "OTHER"
-        )
+        family_tag = {"transaction": "TX", "personal": "PI"}.get(self.family, "OTHER")
         if show_meta:
             eid = self.entity_id or "?"
             return (
@@ -100,6 +99,24 @@ class PageResult:
     words: List[WordSpan] = field(default_factory=list)
     entities: List[DetectedEntity] = field(default_factory=list)
 
+    def words_on_line(self, line_index: int) -> List[WordSpan]:
+        return [w for w in self.words if w.line_index == line_index]
+
+    def line_box(self, line_index: int) -> Optional[BoundingBox]:
+        """Union bounding box of every word on a line."""
+        words = self.words_on_line(line_index)
+        if not words:
+            return None
+        return BoundingBox(
+            x_min=min(w.box.x_min for w in words),
+            y_min=min(w.box.y_min for w in words),
+            x_max=max(w.box.x_max for w in words),
+            y_max=max(w.box.y_max for w in words),
+        ).clamp(self.width, self.height)
+
+    def line_text(self, line_index: int) -> str:
+        return " ".join(w.text for w in self.words_on_line(line_index))
+
 
 @dataclass
 class ScanResult:
@@ -119,6 +136,36 @@ class ScanResult:
         """Stamp stable ``E0001``-style ids onto every detected entity."""
         for index, entity in enumerate(self.all_entities, start=1):
             entity.entity_id = f"E{index:04d}"
+
+    def _next_entity_number(self) -> int:
+        numbers = [
+            int(e.entity_id[1:])
+            for e in self.all_entities
+            if e.entity_id.startswith("E") and e.entity_id[1:].isdigit()
+        ]
+        return (max(numbers) + 1) if numbers else 1
+
+    def add_entities(self, entities: List[DetectedEntity]) -> List[DetectedEntity]:
+        """Append synthetic entities (word matches, lines, found dates).
+
+        Existing ids are preserved; new entities continue the ``E####`` sequence.
+        Duplicates (same page, box, and category) are skipped.
+        """
+        added: List[DetectedEntity] = []
+        number = self._next_entity_number()
+        for entity in entities:
+            page = self.pages[entity.page_index]
+            duplicate = any(
+                existing.box == entity.box and existing.category == entity.category
+                for existing in page.entities
+            )
+            if duplicate:
+                continue
+            entity.entity_id = f"E{number:04d}"
+            number += 1
+            page.entities.append(entity)
+            added.append(entity)
+        return added
 
     def categories(self) -> List[str]:
         """Sorted unique entity categories found in the document."""

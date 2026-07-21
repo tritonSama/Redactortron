@@ -12,9 +12,18 @@ import gradio as gr
 import numpy as np
 
 from redactortron import __version__
+from redactortron.analysis import (
+    DATE_CATEGORIES,
+    build_date_tree,
+    find_all_dates,
+    find_word_matches,
+    line_entities_for,
+)
+from redactortron.core import DEFAULT_LABELS
 from redactortron.exceptions import RedactortronError
 from redactortron.models import DetectedEntity, ScanResult
 from redactortron.service import RedactortronService
+from redactortron.statement import ParsedStatement, Transaction, parse_statement
 from redactortron.taxonomy import MATRIX_VIEWS, view_allows_family
 
 logger = logging.getLogger("redactortron.webui")
@@ -28,8 +37,8 @@ TRINIDAD_FILL = (38, 17, 206)  # red fill in BGR (#ce1126)
 
 
 def _is_trinidad_theme(mode: Optional[str]) -> bool:
-    text = str(mode or "")
-    return THEME_TRINIDAD_LABEL in text or text.lower().startswith("red")
+    text = str(mode or "").lower()
+    return "hitek" in text or "red" in text
 
 
 def _highlight_colors(mode: Optional[str]) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
@@ -189,8 +198,8 @@ label, .label-wrap span {
 """
 
 # Injected live when the theme radio changes (Gradio 6-safe; no DOM class hacks).
-THEME_CYBER_LABEL = "Pink / Cyan / Orange"
-THEME_TRINIDAD_LABEL = "Red / Black / White"
+THEME_CYBER_LABEL = "POC (Cyan / Pink / Orange)"
+THEME_TRINIDAD_LABEL = "Hitek (Red / Black / White)"
 
 TRINIDAD_THEME_CSS = """
 /* Remap every cyber accent token → Trinidad red / white / black */
@@ -510,8 +519,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: #ff2d95 !important; 
 
 def render_theme_css(mode: str) -> str:
     """Return a silent HTML ``<style>`` tag that restyles the live GUI."""
-    use_trinidad = THEME_TRINIDAD_LABEL in str(mode) or str(mode).lower().startswith("red")
-    css = TRINIDAD_THEME_CSS if use_trinidad else CYBER_THEME_CSS
+    css = TRINIDAD_THEME_CSS if _is_trinidad_theme(mode) else CYBER_THEME_CSS
     return f"<style id='rt-live-theme'>{css}</style>"
 
 
@@ -546,9 +554,7 @@ def _entity_rows(
 ) -> List[List[Any]]:
     rows: List[List[Any]] = []
     for entity in entities:
-        family = "TX" if entity.family == "transaction" else (
-            "ACCT" if entity.family == "account" else "OTHER"
-        )
+        family = {"transaction": "TX", "personal": "PI"}.get(entity.family, "OTHER")
         rows.append(
             [
                 entity.entity_id if show_meta else "—",
@@ -607,7 +613,7 @@ def _draw_cyan_highlights(
 def _preview_with_highlights(
     source: Path,
     entities: Sequence[DetectedEntity],
-    max_pages: int = 3,
+    max_pages: Optional[int] = None,
     theme_mode: Optional[str] = None,
 ) -> List[Any]:
     frames = get_service().core.load_pages(source)
@@ -619,6 +625,58 @@ def _preview_with_highlights(
         )
         previews.append(cv2.cvtColor(highlighted, cv2.COLOR_BGR2RGB))
     return previews
+
+
+def _tx_map(state: Optional[Dict[str, Any]]) -> Dict[str, Transaction]:
+    statement: Optional[ParsedStatement] = (state or {}).get("statement")
+    if not statement:
+        return {}
+    return {t.entity_id: t for t in statement.transactions if t.entity_id}
+
+
+def _item_label(
+    entity: DetectedEntity,
+    tx_map: Dict[str, Transaction],
+    show_meta: bool,
+) -> str:
+    """Checklist label; statement transactions mirror the structure tree."""
+    tx = tx_map.get(entity.entity_id)
+    if tx is None:
+        return entity.display_label(show_meta=show_meta)
+    section = tx.section or "(no section)"
+    first_line = tx.description.split("\n", 1)[0].strip() or "(no description)"
+    if len(first_line) > 46:
+        first_line = first_line[:43] + "…"
+    amount = f" · {tx.amount_text}" if tx.amount_text else ""
+    core = (
+        f"p{tx.page} · {section} · #{tx.transaction_number} · "
+        f"{tx.date} · {first_line}{amount}"
+    )
+    if show_meta:
+        return f"{entity.entity_id} · {core}"
+    return core
+
+
+def _order_items(
+    entities: Sequence[DetectedEntity],
+    state: Optional[Dict[str, Any]],
+    tx_map: Dict[str, Transaction],
+) -> List[DetectedEntity]:
+    """Group like the statement tree: page → section → transaction number,
+    followed by the page's remaining entities in reading order."""
+    statement: Optional[ParsedStatement] = (state or {}).get("statement")
+    rank: Dict[str, int] = {}
+    if statement:
+        for index, tx in enumerate(statement.transactions):
+            rank[tx.entity_id] = index
+
+    def key(entity: DetectedEntity) -> Tuple[int, int, int, int]:
+        tx = tx_map.get(entity.entity_id)
+        if tx is not None:
+            return (entity.page_index, 0, rank.get(entity.entity_id, 0), 0)
+        return (entity.page_index, 1, 0, entity.box.y_min)
+
+    return sorted(entities, key=key)
 
 
 def _selection_bundle(
@@ -636,8 +694,11 @@ def _selection_bundle(
     """
     result: ScanResult = state["result"]
     path = Path(state["path"])
-    visible = _visible_entities(result, categories=categories, view=view)
-    choices = [e.display_label(show_meta=show_meta) for e in visible]
+    tx_map = _tx_map(state)
+    visible = _order_items(
+        _visible_entities(result, categories=categories, view=view), state, tx_map
+    )
+    choices = [_item_label(e, tx_map, show_meta) for e in visible]
     choice_ids = {ScanResult.entity_id_from_choice(c) for c in choices}
     id_to_label = {ScanResult.entity_id_from_choice(c): c for c in choices}
 
@@ -666,9 +727,21 @@ def _selection_bundle(
     return items_update, rows, previews, choices, value
 
 
+def _parse_labels(labels_text: Optional[str]) -> Optional[List[str]]:
+    """Turn the editable prompt textarea into a GLiNER label list."""
+    parts = [
+        token.strip().lower()
+        for chunk in str(labels_text or "").splitlines()
+        for token in chunk.split(",")
+        if token.strip()
+    ]
+    return parts or None
+
+
 def scan_document(
     file_obj: Any,
     threshold: float,
+    labels_text: str,
     view: str,
     show_meta: bool,
     theme_mode: str,
@@ -680,7 +753,11 @@ def scan_document(
     service = get_service()
 
     try:
-        summary, result = service.scan(path, threshold=float(threshold))
+        summary, result = service.scan(
+            path,
+            threshold=float(threshold),
+            labels=_parse_labels(labels_text),
+        )
     except RedactortronError as exc:
         exc.log(audience="internal")
         raise gr.Error(exc.format(audience="public")) from exc
@@ -688,13 +765,33 @@ def scan_document(
     if not any(e.entity_id for e in result.all_entities):
         result.assign_entity_ids()
 
-    categories = summary.categories
     state: Dict[str, Any] = {
         "path": str(path),
         "result": result,
         "threshold": float(threshold),
     }
 
+    # Statement parser runs automatically so items are grouped like the tree.
+    statement_tree = (
+        "_No statement structure detected — press **Parse statement** to retry._"
+    )
+    statement_json_val = "[]"
+    header_update = gr.update(choices=[], value=None)
+    statement: Optional[ParsedStatement] = None
+    try:
+        statement = _ensure_statement(state)
+    except Exception:
+        logger.exception("Statement parsing failed; continuing without it")
+    if statement and statement.transactions:
+        statement_tree = statement.tree_markdown()
+        statement_json_val = statement.to_json()
+        header_update = gr.update(
+            choices=list(state.get("headers", {}).keys()),
+            value=None,
+            interactive=True,
+        )
+
+    categories = result.categories()
     items_update, rows, previews, _, _ = _selection_bundle(
         state,
         categories=categories,
@@ -704,14 +801,23 @@ def scan_document(
         theme_mode=theme_mode,
     )
 
-    acct = sum(1 for e in result.all_entities if e.family == "account")
-    txs = sum(1 for e in result.all_entities if e.family == "transaction")
+    dates = [e for e in result.all_entities if e.category in DATE_CATEGORIES]
+    date_tree_val = (
+        build_date_tree(result, dates)
+        if dates
+        else "_Press **Find every date** to build the per-page date tree._"
+    )
+
+    personal = sum(1 for e in result.all_entities if e.family == "personal")
+    tx_count = len(statement.transactions) if statement else 0
     mark = "White/red" if _is_trinidad_theme(theme_mode) else "Cyan"
     summary_md = (
-        f"<div class='rt-status'>⚡ <strong>{summary.entity_count}</strong> items · "
-        f"<strong>{acct}</strong> account info · <strong>{txs}</strong> transactions · "
+        f"<div class='rt-status'>⚡ <strong>{len(result.all_entities)}</strong> items · "
+        f"<strong>{personal}</strong> personal info · "
+        f"<strong>{tx_count}</strong> statement transactions · "
         f"<strong>{summary.page_count}</strong> page(s).<br/>"
-        f"Unchecking a category in <em>02</em> hides it from <em>03</em> and the matrix. "
+        f"Items are grouped page → section → transaction. "
+        f"Use the header picker to (un)select a whole section. "
         f"{mark} boxes mark the current selection in Visual feed.</div>"
     )
 
@@ -720,7 +826,18 @@ def scan_document(
         value=categories,
         interactive=bool(categories),
     )
-    return state, rows, category_update, items_update, previews, summary_md
+    return (
+        state,
+        rows,
+        category_update,
+        items_update,
+        previews,
+        summary_md,
+        statement_tree,
+        statement_json_val,
+        header_update,
+        date_tree_val,
+    )
 
 
 def refresh_filters(
@@ -787,16 +904,484 @@ def select_visible_items(
     if not state or "result" not in state:
         return gr.update()
     result: ScanResult = state["result"]
-    choices = result.item_choices(
-        categories=list(categories or []),
-        view=view or "All",
-        show_meta=bool(show_meta),
+    tx_map = _tx_map(state)
+    visible = _order_items(
+        _visible_entities(result, categories=categories, view=view or "All"),
+        state,
+        tx_map,
     )
+    choices = [_item_label(e, tx_map, bool(show_meta)) for e in visible]
     return gr.update(value=choices)
 
 
 def clear_items() -> Any:
     return gr.update(value=[])
+
+
+def _apply_added_entities(
+    state: Dict[str, Any],
+    added: Sequence[DetectedEntity],
+    categories: Optional[List[str]],
+    view: str,
+    show_meta: bool,
+    items: Optional[List[str]],
+    theme_mode: str,
+    note_text: str,
+    select_added: bool = True,
+) -> Tuple[Any, Any, Any, Any, str]:
+    """Refresh categories/items/matrix/preview after synthetic entities land."""
+    result: ScanResult = state["result"]
+    new_cats = list(categories or [])
+    for entity in added:
+        if entity.category not in new_cats:
+            new_cats.append(entity.category)
+
+    selected = list(items or [])
+    if select_added:
+        # Bare entity ids remap cleanly inside _selection_bundle.
+        selected += [e.entity_id for e in added]
+    items_update, rows, previews, _choices, value = _selection_bundle(
+        state,
+        categories=new_cats,
+        view=view or "All",
+        show_meta=bool(show_meta),
+        selected_items=selected,
+        theme_mode=theme_mode,
+    )
+    category_update = gr.update(
+        choices=result.categories(),
+        value=new_cats,
+        interactive=True,
+    )
+    note = (
+        f"<p class='rt-highlight-note'>{note_text} · "
+        f"{len(value)} item(s) now selected</p>"
+    )
+    return category_update, items_update, rows, previews, note
+
+
+def _entity_ids_for_matches(
+    result: ScanResult, matches: Sequence[DetectedEntity]
+) -> List[str]:
+    """Ids of match entities, whether freshly added or already registered."""
+    ids: List[str] = []
+    for match in matches:
+        if match.entity_id:
+            ids.append(match.entity_id)
+            continue
+        page = result.pages[match.page_index]
+        existing = next(
+            (
+                e
+                for e in page.entities
+                if e.box == match.box and e.category == match.category
+            ),
+            None,
+        )
+        if existing and existing.entity_id:
+            ids.append(existing.entity_id)
+    return ids
+
+
+def _find_word_apply(
+    state: Optional[Dict[str, Any]],
+    term: str,
+    select: bool,
+    categories: Optional[List[str]],
+    view: str,
+    show_meta: bool,
+    items: Optional[List[str]],
+    theme_mode: str,
+) -> Tuple[Any, Any, Any, Any, str]:
+    if not state or "result" not in state:
+        raise gr.Error("Scan a document before searching for a word.")
+    needle = (term or "").strip()
+    if not needle:
+        raise gr.Error("Type a word or phrase to find.")
+
+    result: ScanResult = state["result"]
+    matches = find_word_matches(result, needle)
+    result.add_entities(matches)
+    match_ids = set(_entity_ids_for_matches(result, matches))
+
+    current = {ScanResult.entity_id_from_choice(c) for c in (items or [])}
+    new_ids = (current | match_ids) if select else (current - match_ids)
+
+    new_cats = list(categories or [])
+    if select:
+        for match in matches:
+            if match.category not in new_cats:
+                new_cats.append(match.category)
+
+    items_update, rows, previews, _choices, value = _selection_bundle(
+        state,
+        categories=new_cats,
+        view=view or "All",
+        show_meta=bool(show_meta),
+        selected_items=sorted(new_ids),
+        theme_mode=theme_mode,
+    )
+    cat_update = gr.update(
+        choices=result.categories(), value=new_cats, interactive=True
+    )
+    if not matches:
+        head = f"No matches for “{needle}”"
+    else:
+        verb = "Selected" if select else "Deselected"
+        head = f"{verb} {len(match_ids)} match(es) for “{needle}”"
+    note = (
+        f"<p class='rt-highlight-note'>{head} · "
+        f"{len(value)} item(s) now selected</p>"
+    )
+    return cat_update, items_update, rows, previews, note
+
+
+def find_word_select_handler(
+    state: Optional[Dict[str, Any]],
+    term: str,
+    categories: Optional[List[str]],
+    view: str,
+    show_meta: bool,
+    items: Optional[List[str]],
+    theme_mode: str,
+) -> Tuple[Any, Any, Any, Any, str]:
+    return _find_word_apply(
+        state, term, True, categories, view, show_meta, items, theme_mode
+    )
+
+
+def find_word_deselect_handler(
+    state: Optional[Dict[str, Any]],
+    term: str,
+    categories: Optional[List[str]],
+    view: str,
+    show_meta: bool,
+    items: Optional[List[str]],
+    theme_mode: str,
+) -> Tuple[Any, Any, Any, Any, str]:
+    return _find_word_apply(
+        state, term, False, categories, view, show_meta, items, theme_mode
+    )
+
+
+def add_lines_handler(
+    state: Optional[Dict[str, Any]],
+    categories: Optional[List[str]],
+    view: str,
+    show_meta: bool,
+    items: Optional[List[str]],
+    theme_mode: str,
+) -> Tuple[Any, Any, Any, Any, str]:
+    if not state or "result" not in state:
+        raise gr.Error("Scan a document first.")
+    result: ScanResult = state["result"]
+    ids = [ScanResult.entity_id_from_choice(c) for c in (items or [])]
+    targets = result.entities_for_ids([i for i in ids if i])
+    if not targets:
+        raise gr.Error(
+            "Select at least one item first (e.g. a date or transaction number), "
+            "then this grabs its full line."
+        )
+    lines = line_entities_for(result, targets)
+    added = result.add_entities(lines)
+    note = (
+        f"Captured {len(lines)} full line(s) connected to {len(targets)} "
+        f"selected item(s) — added as LINE items."
+    )
+    return _apply_added_entities(
+        state, added, categories, view, show_meta, items, theme_mode, note
+    )
+
+
+def find_dates_handler(
+    state: Optional[Dict[str, Any]],
+    categories: Optional[List[str]],
+    view: str,
+    show_meta: bool,
+    items: Optional[List[str]],
+    theme_mode: str,
+) -> Tuple[Any, Any, Any, Any, str]:
+    if not state or "result" not in state:
+        raise gr.Error("Scan a document first.")
+    result: ScanResult = state["result"]
+    found = find_all_dates(result)
+    added = result.add_entities(found)
+    note = (
+        f"Date sweep complete: {len(found)} date(s) located "
+        f"({len(added)} new, added as DATE FOUND items)."
+    )
+    return _apply_added_entities(
+        state, added, categories, view, show_meta, items, theme_mode, note
+    )
+
+
+def _build_header_index(statement: ParsedStatement) -> Dict[str, List[str]]:
+    """Header choice → transaction entity ids (whole-document and per-page)."""
+    per_section: Dict[str, List[str]] = {}
+    per_page: Dict[Tuple[int, str], List[str]] = {}
+    for tx in statement.transactions:
+        if not tx.entity_id:
+            continue
+        section = tx.section or "(no section)"
+        per_section.setdefault(section, []).append(tx.entity_id)
+        per_page.setdefault((tx.page, section), []).append(tx.entity_id)
+
+    index: Dict[str, List[str]] = {}
+    for section, ids in per_section.items():
+        index[f"{section} — all pages ({len(ids)})"] = ids
+    for (page, section), ids in per_page.items():
+        index[f"Page {page} — {section} ({len(ids)})"] = ids
+    return index
+
+
+def _ensure_statement(state: Dict[str, Any]) -> ParsedStatement:
+    """Parse the statement once and register each transaction as an item."""
+    if "statement" in state:
+        return state["statement"]
+
+    result: ScanResult = state["result"]
+    statement = parse_statement(result)
+    for tx in statement.transactions:
+        entity = DetectedEntity(
+            text=tx.description or f"{tx.date} {tx.amount_text}".strip(),
+            label="transaction",
+            score=1.0,
+            page_index=tx.page_index,
+            box=tx.box,
+        )
+        added = result.add_entities([entity])
+        if added:
+            tx.entity_id = added[0].entity_id
+        else:
+            page = result.pages[tx.page_index]
+            match = next(
+                (
+                    e
+                    for e in page.entities
+                    if e.box == tx.box and e.category == "TRANSACTION"
+                ),
+                None,
+            )
+            tx.entity_id = match.entity_id if match else ""
+    state["statement"] = statement
+    state["headers"] = _build_header_index(statement)
+    return statement
+
+
+def parse_statement_handler(
+    state: Optional[Dict[str, Any]],
+    categories: Optional[List[str]],
+    view: str,
+    show_meta: bool,
+    items: Optional[List[str]],
+    theme_mode: str,
+) -> Tuple[Any, Any, Any, Any, str, str, str]:
+    if not state or "result" not in state:
+        raise gr.Error("Scan a document before parsing the statement.")
+
+    result: ScanResult = state["result"]
+    before = {e.entity_id for e in result.all_entities}
+    statement = _ensure_statement(state)
+    added = [e for e in result.all_entities if e.entity_id not in before]
+
+    sections = {(t.page, t.section) for t in statement.transactions}
+    pages = {t.page for t in statement.transactions}
+    note = (
+        f"Parsed {len(statement.transactions)} transaction(s) in "
+        f"{len(sections)} section(s) across {len(pages)} page(s) — "
+        f"each is now a selectable TRANSACTION item."
+    )
+    cat_update, items_update, rows, previews, note_html = _apply_added_entities(
+        state, added, categories, view, show_meta, items, theme_mode, note,
+        select_added=False,
+    )
+    header_update = gr.update(
+        choices=list(state.get("headers", {}).keys()),
+        value=None,
+        interactive=True,
+    )
+    return (
+        cat_update,
+        items_update,
+        rows,
+        previews,
+        note_html,
+        statement.tree_markdown(),
+        statement.to_json(),
+        header_update,
+    )
+
+
+def _find_target_apply(
+    state: Optional[Dict[str, Any]],
+    target: str,
+    select: bool,
+    categories: Optional[List[str]],
+    view: str,
+    show_meta: bool,
+    items: Optional[List[str]],
+    theme_mode: str,
+) -> Tuple[Any, Any, Any, Any, str, str]:
+    if not state or "result" not in state:
+        raise gr.Error("Scan a document first.")
+    needle = (target or "").strip()
+    if not needle:
+        raise gr.Error("Type the target text to search transactions for.")
+
+    result: ScanResult = state["result"]
+    statement = _ensure_statement(state)
+
+    matches = statement.search(needle)
+    match_ids = {t.entity_id for t in matches if t.entity_id}
+
+    current = {ScanResult.entity_id_from_choice(c) for c in (items or [])}
+    new_ids = (current | match_ids) if select else (current - match_ids)
+
+    new_cats = list(categories or [])
+    if select and match_ids and "TRANSACTION" not in new_cats:
+        new_cats.append("TRANSACTION")
+
+    items_update, rows, previews, _choices, value = _selection_bundle(
+        state,
+        categories=new_cats,
+        view=view or "All",
+        show_meta=bool(show_meta),
+        selected_items=sorted(new_ids),
+        theme_mode=theme_mode,
+    )
+    cat_update = gr.update(
+        choices=result.categories(), value=new_cats, interactive=True
+    )
+    verb = "selected" if select else "deselected"
+    note = (
+        f"<p class='rt-highlight-note'>Target text matched "
+        f"{len(matches)} transaction(s) ({verb}) · "
+        f"{len(value)} item(s) now selected</p>"
+    )
+    return (
+        cat_update,
+        items_update,
+        rows,
+        previews,
+        note,
+        statement.to_json(matches),
+    )
+
+
+def find_target_select_handler(
+    state: Optional[Dict[str, Any]],
+    target: str,
+    categories: Optional[List[str]],
+    view: str,
+    show_meta: bool,
+    items: Optional[List[str]],
+    theme_mode: str,
+) -> Tuple[Any, Any, Any, Any, str, str]:
+    return _find_target_apply(
+        state, target, True, categories, view, show_meta, items, theme_mode
+    )
+
+
+def find_target_deselect_handler(
+    state: Optional[Dict[str, Any]],
+    target: str,
+    categories: Optional[List[str]],
+    view: str,
+    show_meta: bool,
+    items: Optional[List[str]],
+    theme_mode: str,
+) -> Tuple[Any, Any, Any, Any, str, str]:
+    return _find_target_apply(
+        state, target, False, categories, view, show_meta, items, theme_mode
+    )
+
+
+def _apply_header_selection(
+    state: Optional[Dict[str, Any]],
+    header: Optional[str],
+    select: bool,
+    categories: Optional[List[str]],
+    view: str,
+    show_meta: bool,
+    items: Optional[List[str]],
+    theme_mode: str,
+) -> Tuple[Any, Any, Any, Any, str]:
+    if not state or "result" not in state:
+        raise gr.Error("Scan a document first.")
+    if "statement" not in state:
+        _ensure_statement(state)
+    headers: Dict[str, List[str]] = state.get("headers", {})
+    ids = set(headers.get(header or "", []))
+    if not ids:
+        raise gr.Error("Pick a header (page · section) from the dropdown first.")
+
+    result: ScanResult = state["result"]
+    current = {
+        ScanResult.entity_id_from_choice(c) for c in (items or [])
+    }
+    new_ids = (current | ids) if select else (current - ids)
+
+    new_cats = list(categories or [])
+    if select and "TRANSACTION" not in new_cats:
+        new_cats.append("TRANSACTION")
+
+    items_update, rows, previews, _choices, value = _selection_bundle(
+        state,
+        categories=new_cats,
+        view=view or "All",
+        show_meta=bool(show_meta),
+        selected_items=sorted(new_ids),
+        theme_mode=theme_mode,
+    )
+    cat_update = gr.update(
+        choices=result.categories(), value=new_cats, interactive=True
+    )
+    verb = "Selected" if select else "Unselected"
+    note = (
+        f"<p class='rt-highlight-note'>{verb} {len(ids)} transaction(s) under "
+        f"“{header}” · {len(value)} item(s) now selected</p>"
+    )
+    return cat_update, items_update, rows, previews, note
+
+
+def select_header_handler(
+    state: Optional[Dict[str, Any]],
+    header: Optional[str],
+    categories: Optional[List[str]],
+    view: str,
+    show_meta: bool,
+    items: Optional[List[str]],
+    theme_mode: str,
+) -> Tuple[Any, Any, Any, Any, str]:
+    return _apply_header_selection(
+        state, header, True, categories, view, show_meta, items, theme_mode
+    )
+
+
+def unselect_header_handler(
+    state: Optional[Dict[str, Any]],
+    header: Optional[str],
+    categories: Optional[List[str]],
+    view: str,
+    show_meta: bool,
+    items: Optional[List[str]],
+    theme_mode: str,
+) -> Tuple[Any, Any, Any, Any, str]:
+    return _apply_header_selection(
+        state, header, False, categories, view, show_meta, items, theme_mode
+    )
+
+
+def build_tree_handler(state: Optional[Dict[str, Any]]) -> str:
+    if not state or "result" not in state:
+        return "_Scan a document first, then build the date tree._"
+    result: ScanResult = state["result"]
+    dates = [e for e in result.all_entities if e.category in DATE_CATEGORIES]
+    if not dates:
+        dates = result.add_entities(find_all_dates(result))
+    if not dates:
+        return "_No dates detected anywhere in this document._"
+    return build_date_tree(result, dates)
 
 
 def redact_document(
@@ -923,13 +1508,14 @@ def build_app():
               <p class="rt-kicker">Local · Offline · AI Redaction</p>
               <h1 class="rt-title">REDACTORTRON v{__version__}</h1>
               <p class="rt-sub">
-                Separate account info from transactions, pick individual items,
-                and blur selections — running entirely on your machine.
+                Personal information and transactions in their own sections,
+                a word finder, full-line capture, and a per-page date tree —
+                running entirely on your machine.
               </p>
               <div class="rt-chiprow">
-                <span class="rt-chip">Account info</span>
+                <span class="rt-chip">Personal information</span>
                 <span class="rt-chip alt">Transactions</span>
-                <span class="rt-chip cyan">Selection preview</span>
+                <span class="rt-chip cyan">Date tree</span>
               </div>
             </div>
             """
@@ -965,51 +1551,115 @@ def build_app():
                     ],
                     type="filepath",
                 )
-                threshold = gr.Slider(
-                    minimum=0.1,
-                    maximum=0.9,
-                    value=0.4,
-                    step=0.05,
-                    label="Detection threshold",
-                )
-                scan_btn = gr.Button("01 · Scan document", variant="primary")
-                categories = gr.CheckboxGroup(
-                    label="02 · Categories (unchecked = hidden from 03 + matrix)",
-                    choices=[],
-                    interactive=False,
-                )
+                with gr.Accordion("01 · Detection prompt & parameters", open=False):
+                    labels_box = gr.Textbox(
+                        label="Category prompt (edit / add labels, comma-separated)",
+                        value=", ".join(DEFAULT_LABELS),
+                        lines=4,
+                        placeholder="person, address, account number, merchant, …",
+                    )
+                    threshold = gr.Slider(
+                        minimum=0.1,
+                        maximum=0.9,
+                        value=0.4,
+                        step=0.05,
+                        label="Detection threshold",
+                    )
+                scan_btn = gr.Button("02 · Scan document", variant="primary")
+
                 matrix_view = gr.Radio(
-                    label="Itemized matrix filter",
+                    label="Section (Personal information / Transactions)",
                     choices=list(MATRIX_VIEWS),
                     value="All",
                 )
+                categories = gr.CheckboxGroup(
+                    label="03 · Categories (unchecked = hidden below)",
+                    choices=[],
+                    interactive=False,
+                )
+
+                with gr.Accordion("Find & analyze", open=True):
+                    word_box = gr.Textbox(
+                        label="Find a specific word or phrase",
+                        placeholder="e.g. Walmart",
+                    )
+                    with gr.Row():
+                        find_select_btn = gr.Button("Find + select")
+                        find_deselect_btn = gr.Button("Find + deselect")
+                    line_btn = gr.Button(
+                        "Capture full line(s) of selected items (date / txn #)"
+                    )
+                    with gr.Row():
+                        dates_btn = gr.Button("Find every date")
+                        tree_btn = gr.Button("Build date tree (per page)")
+
+                with gr.Accordion("Statement parser (headers → lines)", open=True):
+                    parse_btn = gr.Button(
+                        "Re-parse statement into sections & transactions"
+                    )
+                    header_dd = gr.Dropdown(
+                        label="Header (section) — pick, then select/unselect all",
+                        choices=[],
+                        value=None,
+                        interactive=True,
+                    )
+                    with gr.Row():
+                        select_header_btn = gr.Button("Select all in header")
+                        unselect_header_btn = gr.Button("Unselect all in header")
+                    target_box = gr.Textbox(
+                        label="Target text (search all transactions)",
+                        placeholder="e.g. Real Time Payment Credit Recd From…",
+                    )
+                    with gr.Row():
+                        target_select_btn = gr.Button("Search + select")
+                        target_deselect_btn = gr.Button("Search + deselect")
+
                 with gr.Row():
                     select_all_btn = gr.Button("Select visible items")
                     clear_btn = gr.Button("Clear items")
                 items = gr.CheckboxGroup(
-                    label="03 · Individual transactions / entities (visible categories only)",
+                    label="04 · Individual items (grouped page → section → transaction)",
                     choices=[],
                     interactive=False,
                 )
-                redact_btn = gr.Button("04 · Blur & export", variant="primary")
+                redact_btn = gr.Button("05 · Blur & export", variant="primary")
                 status = gr.Markdown(
                     "<div class='rt-status'>Awaiting uplink — upload a file, then scan.</div>"
                 )
 
             with gr.Column(scale=2):
+                highlight_note = gr.HTML(
+                    "<p class='rt-highlight-note'>Selection highlight appears after scan.</p>"
+                )
                 entities = gr.Dataframe(
                     headers=_matrix_headers(True),
                     label="Itemized entity matrix",
                     interactive=False,
                     wrap=True,
                 )
-                highlight_note = gr.HTML(
-                    "<p class='rt-highlight-note'>Selection highlight appears after scan.</p>"
-                )
+                with gr.Accordion(
+                    "Statement structure (Bank → Company → Year → Month → "
+                    "Page → Section → Transactions)",
+                    open=True,
+                ):
+                    statement_tree_md = gr.Markdown(
+                        "_Scan, then press **Parse statement** to build the "
+                        "hierarchy and one JSON record per transaction._"
+                    )
+                    statement_json = gr.Code(
+                        label="Transaction records (JSON)",
+                        language="json",
+                        value="[]",
+                    )
+                with gr.Accordion("Date tree (per page)", open=True):
+                    date_tree_md = gr.Markdown(
+                        "_Scan a document, then press **Build date tree** to map "
+                        "every date and the information connected to it, page by page._"
+                    )
                 preview = gr.Gallery(
                     label="Visual feed (highlighted = selected)",
                     columns=2,
-                    height=420,
+                    height=480,
                     object_fit="contain",
                 )
                 download = gr.File(label="Redacted package")
@@ -1038,8 +1688,19 @@ def build_app():
 
         scan_btn.click(
             fn=scan_document,
-            inputs=[file_in, threshold, matrix_view, show_meta, theme_mode],
-            outputs=[state, entities, categories, items, preview, status],
+            inputs=[file_in, threshold, labels_box, matrix_view, show_meta, theme_mode],
+            outputs=[
+                state,
+                entities,
+                categories,
+                items,
+                preview,
+                status,
+                statement_tree_md,
+                statement_json,
+                header_dd,
+                date_tree_md,
+            ],
         )
 
         for trigger in (categories, matrix_view, show_meta):
@@ -1071,6 +1732,85 @@ def build_app():
             outputs=[preview, highlight_note],
         )
 
+        tool_inputs = [state, categories, matrix_view, show_meta, items, theme_mode]
+        tool_outputs = [categories, items, entities, preview, highlight_note]
+
+        word_inputs = [
+            state, word_box, categories, matrix_view, show_meta, items, theme_mode,
+        ]
+        find_select_btn.click(
+            fn=find_word_select_handler,
+            inputs=word_inputs,
+            outputs=tool_outputs,
+        )
+        find_deselect_btn.click(
+            fn=find_word_deselect_handler,
+            inputs=word_inputs,
+            outputs=tool_outputs,
+        )
+        word_box.submit(
+            fn=find_word_select_handler,
+            inputs=word_inputs,
+            outputs=tool_outputs,
+        )
+        line_btn.click(
+            fn=add_lines_handler,
+            inputs=tool_inputs,
+            outputs=tool_outputs,
+        )
+        dates_btn.click(
+            fn=find_dates_handler,
+            inputs=tool_inputs,
+            outputs=tool_outputs,
+        ).then(
+            fn=build_tree_handler,
+            inputs=[state],
+            outputs=[date_tree_md],
+        )
+        tree_btn.click(
+            fn=build_tree_handler,
+            inputs=[state],
+            outputs=[date_tree_md],
+        )
+
+        statement_outputs = tool_outputs + [statement_tree_md, statement_json, header_dd]
+        parse_btn.click(
+            fn=parse_statement_handler,
+            inputs=tool_inputs,
+            outputs=statement_outputs,
+        )
+        header_inputs = [
+            state, header_dd, categories, matrix_view, show_meta, items, theme_mode,
+        ]
+        select_header_btn.click(
+            fn=select_header_handler,
+            inputs=header_inputs,
+            outputs=tool_outputs,
+        )
+        unselect_header_btn.click(
+            fn=unselect_header_handler,
+            inputs=header_inputs,
+            outputs=tool_outputs,
+        )
+        target_inputs = [
+            state, target_box, categories, matrix_view, show_meta, items, theme_mode,
+        ]
+        target_select_btn.click(
+            fn=find_target_select_handler,
+            inputs=target_inputs,
+            outputs=tool_outputs + [statement_json],
+        )
+        target_deselect_btn.click(
+            fn=find_target_deselect_handler,
+            inputs=target_inputs,
+            outputs=tool_outputs + [statement_json],
+        )
+        target_box.submit(
+            fn=find_target_select_handler,
+            inputs=target_inputs,
+            outputs=tool_outputs + [statement_json],
+        )
+
         redact_btn.click(
             fn=redact_document,
             inputs=[state, categories, items, theme_mode],
@@ -1078,8 +1818,9 @@ def build_app():
         )
 
         gr.HTML(
-            "<p class='rt-foot'>Matrix filter switches Account information vs Account "
-            "transactions. Unchecked categories disappear from the item list.</p>"
+            "<p class='rt-foot'>Section switch: Personal information vs Transactions. "
+            "Word matches, captured lines, and found dates appear as selectable items "
+            "in 04 and blur on export.</p>"
         )
 
     return demo, theme

@@ -1,0 +1,403 @@
+# .cursorrules
+# Project: Redactortron
+# Purpose:
+# Redactortron is the transaction extraction engine that runs BEFORE any
+# redaction or blur operation. It converts bank statements into structured,
+# selectable transaction objects so downstream tools can blur only the
+# user-selected transaction.
+
+You are an expert document parser specializing in financial statements.
+
+# =============================================================================
+# PRIMARY OBJECTIVE
+# =============================================================================
+
+Never perform redaction during this stage.
+
+Your ONLY responsibility is to build an accurate transaction map of the document.
+
+Think of this as creating selectable regions.
+
+The redaction engine will consume these regions later.
+
+Output must preserve enough positional and structural information so that
+an entire transaction—including wrapped description lines and its amount—
+can be selected with a single click.
+
+# =============================================================================
+# PARSING ORDER
+# =============================================================================
+
+Process documents in this exact hierarchy.
+
+Document
+    Bank
+        Company
+            Year
+                Month
+                    Page
+                        Section
+                            Transaction
+
+Never flatten the hierarchy.
+
+# =============================================================================
+# PAGE PROCESSING
+# =============================================================================
+
+Every page is parsed independently.
+
+Each page contains one or more sections.
+
+Examples:
+
+Deposits and Additions
+
+Checks Paid
+
+ATM & Debit Card Withdrawals
+
+Electronic Withdrawals
+
+Fees
+
+Daily Ending Balance
+
+Detect section headers automatically.
+
+A section begins at its title.
+
+A section ends immediately before the next section title.
+
+# =============================================================================
+# TRANSACTION DETECTION
+# =============================================================================
+
+A transaction ALWAYS begins with a line whose first token is a date.
+
+Examples
+
+12/01
+
+12/15
+
+01/31
+
+Never start a transaction from any other pattern.
+
+Everything after the starting date belongs to that same transaction until:
+
+• another line begins with a date
+
+OR
+
+• another section begins
+
+OR
+
+• the page ends
+
+Continuation lines are NEVER standalone transactions.
+
+# =============================================================================
+# MULTI-LINE TRANSACTIONS
+# =============================================================================
+
+Many bank statements wrap descriptions across multiple lines.
+
+Example
+
+12/12
+Wire Reversal
+B/O JPMorgan Chase Bank National
+Retail Inv Ref...
+Org Fx
+154.00
+
+This entire block is ONE transaction.
+
+Never split wrapped descriptions.
+
+Never separate the amount.
+
+The amount belongs to the originating date.
+
+# =============================================================================
+# TRANSACTION OBJECT
+# =============================================================================
+
+Every transaction becomes one object.
+
+{
+    id,
+    bank,
+    company,
+    year,
+    month,
+    page,
+    section,
+    transaction_index,
+    date,
+    description,
+    amount
+}
+
+description must contain ALL wrapped lines.
+
+Maintain original order.
+
+# =============================================================================
+# POSITIONAL INFORMATION
+# =============================================================================
+
+Every transaction must also include positional metadata.
+
+Store:
+
+page_number
+
+start_line
+
+end_line
+
+bounding_box (if OCR provides coordinates)
+
+text_offsets (if available)
+
+This allows downstream selection without reparsing.
+
+# =============================================================================
+# UNIQUE IDENTIFIER
+# =============================================================================
+
+Generate deterministic IDs.
+
+Example
+
+CHASE_HITEK_2022_DEC_P2_DEP_003
+
+or
+
+bank_company_year_month_page_section_transaction
+
+IDs must never change unless the statement changes.
+
+# =============================================================================
+# SEARCH INDEX
+# =============================================================================
+
+Every transaction is searchable by
+
+date
+
+description
+
+amount
+
+reference numbers
+
+trace numbers
+
+wire IDs
+
+merchant names
+
+ABA numbers
+
+routing numbers
+
+account fragments
+
+transaction IDs
+
+The search engine searches the COMPLETE description.
+
+Never search only the first line.
+
+# =============================================================================
+# USER SELECTION MODEL
+# =============================================================================
+
+The user never selects text manually.
+
+Instead the UI allows
+
+Date
+    ↓
+
+Transactions on that date
+    ↓
+
+Transaction selected
+    ↓
+
+Entire transaction becomes highlighted
+
+The highlight includes
+
+Date
+
+Every wrapped description line
+
+Amount
+
+Nothing outside the transaction should become selected.
+
+# =============================================================================
+# MULTIPLE TRANSACTIONS SAME DATE
+# =============================================================================
+
+If multiple transactions share the same date
+
+12/12
+
+Transaction 1
+
+Transaction 2
+
+Transaction 3
+
+Each must become an independent selectable object.
+
+Selecting Transaction 2 must not include Transaction 1 or Transaction 3.
+
+# =============================================================================
+# SECTION COUNTS
+# =============================================================================
+
+Validate transaction counts.
+
+Example
+
+Deposits and Additions
+
+Header says
+
+9 transactions
+
+Parser must output exactly 9 transaction objects.
+
+Electronic Withdrawals
+
+Header says
+
+10 transactions
+
+Parser must output exactly 10 objects.
+
+If counts differ
+
+Raise a validation warning.
+
+# =============================================================================
+# VALIDATION
+# =============================================================================
+
+Ensure
+
+Every date has an amount.
+
+Every amount belongs to exactly one transaction.
+
+Every transaction belongs to exactly one section.
+
+Every section belongs to exactly one page.
+
+No duplicate transactions.
+
+No missing transactions.
+
+No orphaned continuation lines.
+
+# =============================================================================
+# REDACTION PIPELINE
+# =============================================================================
+
+Redactortron has two stages.
+
+Stage 1
+
+Document Parsing
+
+↓
+
+Transaction Mapping
+
+↓
+
+Selection Objects
+
+Stage 2
+
+User selects transaction
+
+↓
+
+Selection object retrieved
+
+↓
+
+Blur engine receives coordinates
+
+↓
+
+Blur applied
+
+Parsing NEVER modifies the document.
+
+Blur engine NEVER reparses the document.
+
+# =============================================================================
+# FUTURE OCR SUPPORT
+# =============================================================================
+
+If OCR coordinates exist
+
+Store them.
+
+If PDF text exists
+
+Prefer embedded text over OCR.
+
+If OCR confidence is low
+
+Flag the transaction.
+
+Never guess.
+
+# =============================================================================
+# OUTPUT
+# =============================================================================
+
+Preferred output
+
+JSON
+
+Hierarchy
+
+Bank
+ Company
+  Year
+   Month
+    Page
+     Section
+      Transactions[]
+
+Every transaction must be independently selectable.
+
+This transaction map is the authoritative source for all downstream
+redaction, search, export, audit, and review operations.
+
+# =============================================================================
+# PROJECT PRINCIPLE
+# =============================================================================
+
+Redactortron never asks:
+
+"What text should I blur?"
+
+Redactortron asks:
+
+"Which transaction object did the user select?"
+
+Everything else follows from that selection.

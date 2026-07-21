@@ -239,6 +239,7 @@ class RedactortronCore:
         words: List[WordSpan] = []
         text_parts: List[str] = []
         cursor = 0
+        line_counter = 0
 
         page = result.pages[0]
         for block in page.blocks:
@@ -262,10 +263,12 @@ class RedactortronCore:
                             page_index=page_index,
                             start_char=start,
                             end_char=end,
+                            line_index=line_counter,
                         )
                     )
                     text_parts.append(token)
                     cursor = end + 1
+                line_counter += 1
 
         full_text = " ".join(text_parts)
         return PageResult(

@@ -1,11 +1,11 @@
-"""Category families: account information vs transactions."""
+"""Category families: personal information vs transactions."""
 
 from __future__ import annotations
 
 from typing import FrozenSet
 
-# Holder / identity / banking coordinates (not line-item activity).
-ACCOUNT_INFO_CATEGORIES: FrozenSet[str] = frozenset(
+# Identity / holder data (name, address, account coordinates…).
+PERSONAL_INFO_CATEGORIES: FrozenSet[str] = frozenset(
     {
         "PERSON",
         "ORGANIZATION",
@@ -37,39 +37,37 @@ TRANSACTION_CATEGORIES: FrozenSet[str] = frozenset(
         "DEPOSIT",
         "WITHDRAWAL",
         "DATE",
+        # Full statement records produced by the statement parser.
+        "TRANSACTION",
     }
 )
 
-FAMILY_ACCOUNT = "account"
+FAMILY_PERSONAL = "personal"
 FAMILY_TRANSACTION = "transaction"
 FAMILY_OTHER = "other"
 
 MATRIX_VIEWS = (
     "All",
-    "Account information",
-    "Account transactions",
+    "Personal information",
+    "Transactions",
 )
 
 
 def category_family(category: str) -> str:
     key = category.strip().upper()
-    in_account = key in ACCOUNT_INFO_CATEGORIES
+    in_personal = key in PERSONAL_INFO_CATEGORIES
     in_tx = key in TRANSACTION_CATEGORIES
-    if in_account and not in_tx:
-        return FAMILY_ACCOUNT
-    if in_tx and not in_account:
-        return FAMILY_TRANSACTION
-    if in_account and in_tx:
-        # Prefer transaction for shared labels like DATE when viewing txs.
+    if in_personal and not in_tx:
+        return FAMILY_PERSONAL
+    if in_tx:
+        # Shared labels like DATE lean transaction.
         return FAMILY_TRANSACTION
     return FAMILY_OTHER
 
 
 def view_allows_family(view: str, family: str) -> bool:
-    if view == "All":
-        return True
-    if view == "Account information":
-        return family in {FAMILY_ACCOUNT, FAMILY_OTHER}
-    if view == "Account transactions":
+    if view == "Personal information":
+        return family == FAMILY_PERSONAL
+    if view == "Transactions":
         return family == FAMILY_TRANSACTION
     return True
